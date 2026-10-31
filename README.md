@@ -16,8 +16,11 @@ usable on its own, on Windows, Linux and macOS.
   starts where the TOC says, every digest matches.
 - **Checked against containerd's Go package**, both ways: Go reads what
   stargazer writes, and stargazer what Go writes.
+- **Update plans**: which gzip members of a new blob old blobs already
+  have, and which byte ranges must be fetched, so an update can build the
+  new blob from the old one and a few ranged requests.
 
-Version 0.1.0. The TOC model is general enough for zstd:chunked's, which
+Version 0.2.0. The TOC model is general enough for zstd:chunked's, which
 derives from eStargz's; that format comes when Zig has a zstd compressor.
 
 ## The command
@@ -29,6 +32,7 @@ zig-out/bin/stargazer verify --toc-digest=sha256:... layer.esgz
 zig-out/bin/stargazer ls layer.esgz
 zig-out/bin/stargazer cat layer.esgz usr/bin/tool > tool
 zig-out/bin/stargazer extract --jobs=4 layer.esgz dir
+zig-out/bin/stargazer plan old.esgz new.esgz
 ```
 
 `convert` prints the TOC's digest and the tar's size, the values of the
@@ -55,6 +59,25 @@ try r.readFile(gpa, &scratch, r.lookup("usr/bin/tool").?, &out);
 
 `source` is a `stargazer.Source`: `Source.fromBytes`, `Source.File`, or any
 read-at function.
+
+An update between two blobs, the new one opened through ranged requests:
+
+```zig
+var p = try stargazer.plan.make(gpa, new_reader, &.{old_reader});
+defer p.deinit();
+// Fewer, longer requests; the tail read to open the new blob is at hand.
+try p.coalesce(.{ .max_requests = 64, .have_from = tail_start });
+for (p.pieces) |piece| switch (piece) {
+    .copy => |c| {}, // c.len bytes of old blob c.source from c.offset
+    .fetch => |f| {}, // f.len bytes of the new blob from f.offset
+};
+```
+
+A member is copied when an old one has the same compressed length, payload
+digest and, for a file's last chunk, the same entries after it up to the
+next payload as the TOC lists them: their tar headers are in the member
+too. The TOC can't prove those headers byte for byte, so check the blob
+built against its digest. `plan.apply` builds it from `Source`s.
 
 ## From C
 

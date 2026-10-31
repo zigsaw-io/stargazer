@@ -24,6 +24,9 @@ const usage =
     \\                          digest if given, and every file's and chunk's digest
     \\  extract [--jobs=<n>] <blob> <dir>
     \\                          write the directories and files into a new directory, checked
+    \\  plan [--max-requests=<n>] [--min-gap=<bytes>] <old>... <new>
+    \\                          how much of the new blob an update could copy from the old
+    \\                          ones, and how much it must fetch, in how many requests
     \\  version                 print the version
     \\
 ;
@@ -117,7 +120,48 @@ fn run(io: Io, gpa: Allocator, arena: Allocator, all_args: []const [:0]const u8)
         var blob = try Blob.open(io, gpa, args.items[0]);
         defer blob.close(io);
         try blob.reader.extract(io, gpa, args.items[1], opts);
+    } else if (std.mem.eql(u8, command, "plan")) {
+        if (args.items.len < 2) return error.Usage;
+        try expectArgs(args.items, args.items.len, options, &.{ "max-requests", "min-gap" });
+        var opts: stargazer.plan.Plan.CoalesceOptions = .{};
+        if (options.get("max-requests")) |text| opts.max_requests = std.fmt.parseInt(usize, text, 10) catch return error.Usage;
+        if (options.get("min-gap")) |text| opts.min_gap = std.fmt.parseInt(u64, text, 10) catch return error.Usage;
+        if (opts.max_requests == 0) return error.Usage;
+        try plan(io, gpa, arena, args.items[0 .. args.items.len - 1], args.items[args.items.len - 1], opts, out);
     } else return error.Usage;
+}
+
+fn plan(io: Io, gpa: Allocator, arena: Allocator, old_paths: []const []const u8, new_path: []const u8, options: stargazer.plan.Plan.CoalesceOptions, out: *Io.Writer) !void {
+    const olds = try arena.alloc(Blob, old_paths.len);
+    const readers = try arena.alloc(*const estargz.Reader, old_paths.len);
+    var opened: usize = 0;
+    defer for (olds[0..opened]) |*b| b.close(io);
+    for (old_paths, olds, readers) |path, *b, *r| {
+        b.* = try Blob.open(io, gpa, path);
+        opened += 1;
+        r.* = b.reader;
+    }
+    var new = try Blob.open(io, gpa, new_path);
+    defer new.close(io);
+
+    var p = try stargazer.plan.make(gpa, new.reader, readers);
+    defer p.deinit();
+    var opts = options;
+    // Opening the blob read its TOC and footer.
+    opts.have_from = new.reader.footer.toc_offset;
+    try p.coalesce(opts);
+    const size = new.reader.source.size;
+    const tail = size - opts.have_from;
+    const percent = struct {
+        fn of(part: u64, whole: u64) f64 {
+            return if (whole == 0) 0 else 100 * @as(f64, @floatFromInt(part)) / @as(f64, @floatFromInt(whole));
+        }
+    }.of;
+    try out.print("blob size          {d}\n", .{size});
+    try out.print("copied             {d} ({d:.1}%)\n", .{ p.copied(), percent(p.copied(), size) });
+    try out.print("fetched            {d} ({d:.1}%) in {d} requests, and {d} of TOC and footer\n", .{
+        p.fetched() - tail, percent(p.fetched() - tail, size), p.requests(opts.have_from), tail,
+    });
 }
 
 fn expectArgs(args: []const []const u8, n: usize, options: std.StringHashMapUnmanaged([]const u8), allowed: []const []const u8) !void {

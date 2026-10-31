@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - name: Unit tests
+        run: zig build test --summary all
+      - name: The C interface, against its header
+        run: zig build test-c
+      - name: Release build
+        run: zig build -Doptimize=ReleaseFast
+
+  # containerd's Go package reads what stargazer writes, and the reverse.
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: conformance/go/go.mod
+          cache-dependency-path: conformance/go/go.sum
+      - run: zig build -Doptimize=ReleaseFast
+      - run: sh conformance/run.sh "$PWD/zig-out/bin/stargazer" "$RUNNER_TEMP/conformance"
+
+  # Zig's fuzzer runs on Linux only, so far. Bounded, so the job ends.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - run: zig build test --fuzz=200K

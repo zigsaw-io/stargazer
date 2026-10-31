@@ -45,7 +45,11 @@ jobs:
       - run: zig build -Doptimize=ReleaseFast
       - run: sh conformance/run.sh "$PWD/zig-out/bin/stargazer" "$RUNNER_TEMP/conformance"
 
-  # Zig's fuzzer runs on Linux only, so far. Bounded, so the job ends.
+  # Zig's fuzzer runs on Linux only, so far. Bounded, so the job ends: 20K
+  # runs of each test take 3 minutes with the build, and cover nearly what
+  # 200K do in 16 (2,504 and 2,615 of 15,877 PCs). Not in Debug: Zig's own
+  # x86-64 backend, which Debug uses, doesn't instrument for coverage, so
+  # the fuzzer runs blind and its report fails ("pcs_len was zero").
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -55,4 +59,4 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
-      - run: zig build test --fuzz=200K
+      - run: zig build test --fuzz=20K -Doptimize=ReleaseSafe

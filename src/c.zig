@@ -262,6 +262,26 @@ export fn sg_reader_read_file(h: *Handle, index: usize, write: ?WriteFn, ctx: ?*
     return @backingInt(Status.ok);
 }
 
+export fn sg_reader_read_range(h: *Handle, index: usize, offset: u64, length: u64, write: ?WriteFn, ctx: ?*anyopaque, first: ?*u64) c_int {
+    const callback = write orelse return invalid("write is NULL");
+    const start = first orelse return invalid("first is NULL");
+    if (index >= h.reader.files.len) return invalid("index out of range");
+    const f = &h.reader.files[index];
+    if (f.entry.type != .reg) return invalid("not a regular file");
+    const chunks = f.chunksIn(offset, offset +| length);
+    start.* = if (chunks.len > 0) chunks[0].file_offset else offset;
+    // Each chunk whole, and only once its digest checks.
+    var chunk: Io.Writer.Allocating = .init(gpa);
+    defer chunk.deinit();
+    for (chunks) |c| {
+        chunk.clearRetainingCapacity();
+        h.reader.readChunk(gpa, &h.scratch, c, &chunk.writer) catch |err| return fail(err);
+        const bytes = chunk.written();
+        if (callback(ctx, bytes.ptr, bytes.len) != 0) return fail(error.CallbackFailed);
+    }
+    return @backingInt(Status.ok);
+}
+
 export fn sg_reader_verify(h: *const Handle, toc_digest: ?[*:0]const u8) c_int {
     if (toc_digest) |text| {
         const want = Toc.parseDigest(std.mem.span(text)) catch return invalid("toc_digest isn't sha256:<hex>");

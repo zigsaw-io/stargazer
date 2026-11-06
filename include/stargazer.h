@@ -81,6 +81,12 @@ int sg_reader_entry(const sg_reader *r, size_t index, sg_entry *out);
 int sg_reader_lookup(const sg_reader *r, const char *name, size_t *index);
 /* Writes a regular file's contents, checking each chunk's digest. */
 int sg_reader_read_file(sg_reader *r, size_t index, sg_write_fn write, void *ctx);
+/* Writes the chunks of a regular file that hold any of its bytes from offset,
+ * for length bytes, each whole and only once its digest checks, in order; sets
+ * *first to where the first of them starts in the file (offset if there are
+ * none, as past the end). For serving part of a file. */
+int sg_reader_read_range(sg_reader *r, size_t index, uint64_t offset, uint64_t length,
+                         sg_write_fn write, void *ctx, uint64_t *first);
 /* Reads the whole blob and checks it against the TOC: entries, the gzip
  * members' places, every digest; and the TOC's digest, if toc_digest isn't
  * NULL. */

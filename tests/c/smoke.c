@@ -109,6 +109,15 @@ int main(void) {
     CHECK(e.type == SG_REG && e.size == sizeof hello - 1 && e.chunks == 1 && e.digest != NULL);
     CHECK(sg_reader_read_file(r, index, write_cb, &contents) == SG_OK);
     CHECK(contents.len == sizeof hello - 1 && memcmp(contents.data, hello, contents.len) == 0);
+    /* A byte in the middle comes as its whole chunk, the file's only one. */
+    uint64_t first = 99;
+    contents.len = 0;
+    CHECK(sg_reader_read_range(r, index, 3, 1, write_cb, &contents, &first) == SG_OK);
+    CHECK(first == 0 && contents.len == sizeof hello - 1 && memcmp(contents.data, hello, contents.len) == 0);
+    contents.len = 0;
+    CHECK(sg_reader_read_range(r, index, sizeof hello, 10, write_cb, &contents, &first) == SG_OK);
+    CHECK(first == sizeof hello && contents.len == 0);
+    CHECK(sg_reader_read_range(r, 1, 0, 1, write_cb, &contents, &first) == SG_ERR_INVALID);
     CHECK(sg_reader_lookup(r, "missing", &index) == SG_ERR_NOT_FOUND);
 
     CHECK(sg_reader_verify(r, result.toc_digest) == SG_OK);

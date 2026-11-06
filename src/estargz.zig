@@ -427,6 +427,25 @@ pub const Reader = struct {
         size: u64,
         digest: ?[Sha256.digest_length]u8,
         chunks: []const Chunk,
+
+        /// The chunks that hold any of the file's bytes from `start` up to
+        /// `end` (exclusive), in order: what serving part of a file reads,
+        /// with `readChunk`. None for an empty range, or one past the end.
+        pub fn chunksIn(f: *const File, start: u64, end: u64) []const Chunk {
+            if (start >= end or start >= f.size) return &.{};
+            // The first chunk that ends after `start`, and the first that
+            // starts at or after `end`; chunks cover the file in order.
+            var lo: usize = 0;
+            var hi: usize = f.chunks.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const c = f.chunks[mid];
+                if (c.file_offset + c.size <= start) lo = mid + 1 else hi = mid;
+            }
+            var last = lo;
+            while (last < f.chunks.len and f.chunks[last].file_offset < end) last += 1;
+            return f.chunks[lo..last];
+        }
     };
 
     pub const Chunk = struct {
@@ -613,13 +632,21 @@ pub const Reader = struct {
     /// digest and the file's.
     pub fn readFile(r: *const Reader, gpa: Allocator, scratch: *Scratch, file: *const File, out: *Io.Writer) !void {
         var file_hash: Sha256 = .init(.{});
-        for (file.chunks) |c| try r.readChunk(gpa, scratch, c, out, &file_hash);
+        for (file.chunks) |c| try r.readChunkHashing(gpa, scratch, c, out, &file_hash);
         if (file.digest) |want| {
             if (!std.mem.eql(u8, &file_hash.finalResult(), &want)) return error.EstargzDigestMismatch;
         }
     }
 
-    fn readChunk(r: *const Reader, gpa: Allocator, scratch: *Scratch, c: Chunk, out: *Io.Writer, file_hash: *Sha256) !void {
+    /// Writes one chunk of a regular file to `out`, `c.size` bytes from
+    /// `c.file_offset`, checking the chunk's digest. Nothing reaches `out`
+    /// unchecked only if the caller holds back what's written until this
+    /// returns. A `Scratch` for each thread; the reader is shared.
+    pub fn readChunk(r: *const Reader, gpa: Allocator, scratch: *Scratch, c: Chunk, out: *Io.Writer) !void {
+        return r.readChunkHashing(gpa, scratch, c, out, null);
+    }
+
+    fn readChunkHashing(r: *const Reader, gpa: Allocator, scratch: *Scratch, c: Chunk, out: *Io.Writer, file_hash: ?*Sha256) !void {
         try scratch.compressed.resize(gpa, @intCast(c.end - c.offset));
         try r.source.readAll(c.offset, scratch.compressed.items);
         const window = scratch.window orelse w: {
@@ -635,7 +662,7 @@ pub const Reader = struct {
             const bytes = d.reader.peekGreedy(1) catch |err| return memberError(&d, err);
             const n: usize = @intCast(@min(@as(u64, bytes.len), left));
             chunk_hash.update(bytes[0..n]);
-            file_hash.update(bytes[0..n]);
+            if (file_hash) |h| h.update(bytes[0..n]);
             try out.writeAll(bytes[0..n]);
             d.reader.toss(n);
             left -= n;
@@ -957,6 +984,52 @@ test "converted, read back, and checked whole" {
     try std.testing.expectEqual(names.len + 1, report.entries);
     try std.testing.expectEqual(6, report.chunks);
     try std.testing.expectEqual(result.uncompressed_size, report.uncompressed_size);
+}
+
+test "part of a file, a chunk at a time" {
+    const gpa = std.testing.allocator;
+    const blob, _ = try testBlob(gpa, 4096);
+    defer gpa.free(blob);
+    const blob_const: []const u8 = blob;
+    const r = try Reader.open(gpa, .fromBytes(&blob_const), .{});
+    defer r.deinit();
+    const big = r.lookup("share/big.dat").?;
+    // Chunks at 0, 4096 and 8192, of a 10,000-byte file.
+    const Case = struct { start: u64, end: u64, first: usize, count: usize };
+    for ([_]Case{
+        .{ .start = 0, .end = 1, .first = 0, .count = 1 },
+        .{ .start = 4095, .end = 4097, .first = 0, .count = 2 },
+        .{ .start = 4096, .end = 8192, .first = 1, .count = 1 },
+        .{ .start = 4096, .end = big_len, .first = 1, .count = 2 },
+        .{ .start = 0, .end = 1 << 40, .first = 0, .count = 3 },
+        .{ .start = big_len - 1, .end = big_len, .first = 2, .count = 1 },
+        .{ .start = 5, .end = 5, .first = 0, .count = 0 },
+        .{ .start = big_len, .end = big_len + 10, .first = 0, .count = 0 },
+    }) |case| {
+        const got = big.chunksIn(case.start, case.end);
+        try std.testing.expectEqual(case.count, got.len);
+        if (case.count > 0) try std.testing.expectEqual(big.chunks[case.first].file_offset, got[0].file_offset);
+    }
+    try std.testing.expectEqual(0, r.lookup("empty").?.chunksIn(0, 10).len);
+
+    // Read one chunk at a time, the file comes out whole.
+    var scratch: Reader.Scratch = .{};
+    defer scratch.deinit(gpa);
+    var got: Io.Writer.Allocating = .init(gpa);
+    defer got.deinit();
+    for (big.chunksIn(0, big_len)) |c| {
+        try std.testing.expectEqual(c.file_offset, got.written().len);
+        try r.readChunk(gpa, &scratch, c, &got.writer);
+    }
+    var want: [big_len]u8 = undefined;
+    testBytes(&want);
+    try std.testing.expectEqualSlices(u8, &want, got.written());
+
+    // A chunk whose digest isn't what the TOC says is refused.
+    var wrong = big.chunks[1];
+    wrong.digest.?[0] ^= 1;
+    var sink: Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.EstargzDigestMismatch, r.readChunk(gpa, &scratch, wrong, &sink.writer));
 }
 
 test "the same bytes every time" {

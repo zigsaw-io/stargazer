@@ -11,7 +11,8 @@ usable on its own, on Windows, Linux and macOS.
   bytes: tar headers are kept byte for byte, and a test pins the output.
 - **A reader through a read-at callback**, so a blob can be a file, bytes in
   memory, or ranged HTTP requests the caller makes. It checks every chunk's
-  digest as it reads.
+  digest as it reads, and reads part of a file a chunk at a time, as a
+  filesystem that fetches files on demand serves them.
 - **A strict verifier**: the tar entries are the TOC's, every gzip member
   starts where the TOC says, every digest matches.
 - **Checked against containerd's Go package**, both ways: Go reads what
@@ -20,7 +21,7 @@ usable on its own, on Windows, Linux and macOS.
   have, and which byte ranges must be fetched, so an update can build the
   new blob from the old one and a few ranged requests.
 
-Version 0.2.0. The TOC model is general enough for zstd:chunked's, which
+Version 0.3.0. The TOC model is general enough for zstd:chunked's, which
 derives from eStargz's; that format comes when Zig has a zstd compressor.
 
 ## The command
@@ -55,6 +56,9 @@ if (!std.mem.eql(u8, &r.toc_digest, &want)) return error.WrongToc;
 var scratch: estargz.Reader.Scratch = .{};
 defer scratch.deinit(gpa);
 try r.readFile(gpa, &scratch, r.lookup("usr/bin/tool").?, &out);
+// Or part of it: the chunks that hold those bytes, each whole and checked.
+const file = r.lookup("usr/lib/big.so").?;
+for (file.chunksIn(offset, offset + len)) |c| try r.readChunk(gpa, &scratch, c, &out);
 ```
 
 `source` is a `stargazer.Source`: `Source.fromBytes`, `Source.File`, or any

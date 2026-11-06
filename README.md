@@ -21,7 +21,7 @@ usable on its own, on Windows, Linux and macOS.
   have, and which byte ranges must be fetched, so an update can build the
   new blob from the old one and a few ranged requests.
 
-Version 0.3.0. The TOC model is general enough for zstd:chunked's, which
+Version 0.4.0. The TOC model is general enough for zstd:chunked's, which
 derives from eStargz's; that format comes when Zig has a zstd compressor.
 
 ## The command
@@ -29,6 +29,7 @@ derives from eStargz's; that format comes when Zig has a zstd compressor.
 ```
 zig build -Doptimize=ReleaseFast
 zig-out/bin/stargazer convert layer.tar.gz layer.esgz   # or a plain tar
+zig-out/bin/stargazer convert --prioritized=first.txt layer.tar layer.esgz
 zig-out/bin/stargazer verify --toc-digest=sha256:... layer.esgz
 zig-out/bin/stargazer ls layer.esgz
 zig-out/bin/stargazer cat layer.esgz usr/bin/tool > tool
@@ -39,7 +40,10 @@ zig-out/bin/stargazer plan old.esgz new.esgz
 `convert` prints the TOC's digest and the tar's size, the values of the
 `containerd.io/snapshot/stargz/toc.digest` and
 `io.containers.estargz.uncompressed-size` annotations a layer's descriptor
-carries.
+carries. With `--prioritized`, a file of names, one a line, those files
+come first, each after its parent directories, then the prefetch landmark:
+what a lazy reader fetches before anything asks for it. That needs a plain
+tar, read twice.
 
 ## From Zig
 
@@ -49,6 +53,8 @@ const stargazer = @import("stargazer");
 const estargz = stargazer.estargz;
 
 const result = try estargz.convert(gpa, &tar_reader, &blob_writer, .{});
+// Prioritized files need a tar that can be read anywhere.
+_ = try estargz.convertSource(gpa, tar_source, &blob_writer, .{ .prioritized = &.{"bin/tool"} }, null);
 
 const r = try estargz.Reader.open(gpa, source, .{});
 defer r.deinit();
@@ -111,7 +117,10 @@ sh conformance/run.sh "$PWD/zig-out/bin/stargazer"   # needs Go 1.25
 
 As containerd's Go writer does, except where noted:
 
-- The no-prefetch landmark comes first; no files are prioritized.
+- The no-prefetch landmark comes first, unless files are prioritized: then
+  they do, each after its parent directories, in the order given, then the
+  prefetch landmark, then everything else in the tar's order, as Go's
+  `WithPrioritizedFiles` lays them out (the conformance check compares).
 - Members start at each payload and every 4 MiB inside one; no
   `innerOffset` packing, which Go's verifier can't check.
 - The TOC is tab-indented JSON with Go's fields in Go's order, zero values

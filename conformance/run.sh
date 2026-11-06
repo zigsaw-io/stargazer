@@ -47,4 +47,18 @@ for name in share/big.dat share/two.dat bin/tool; do
 	cmp "$work/ours.cat" "$work/go.cat"
 done
 
-echo "conformance: ok ($(wc -l <"$work/ours.ls") entries, both ways)"
+# Prioritized files, both ways, and the same order of entries in each: the
+# blob's, unsorted, landmarks included.
+printf 'share/two.dat\nbin/tool\n' >"$work/prio.txt"
+"$sg" convert --chunk-size=$chunk --prioritized="$work/prio.txt" "$work/t.tar" "$work/ours-p.esgz" >"$work/ours-p.txt"
+ptoc=$(sed -n 's/^toc digest *//p' "$work/ours-p.txt")
+"$check" check "$work/ours-p.esgz" "$ptoc" >/dev/null
+"$sg" verify --toc-digest="$ptoc" "$work/ours-p.esgz"
+go_ptoc=$("$check" build $chunk "$work/t.tar" "$work/go-p.esgz" "$work/prio.txt")
+"$sg" verify --toc-digest="$go_ptoc" "$work/go-p.esgz"
+"$sg" ls "$work/ours-p.esgz" | awk '{ print $4 }' >"$work/ours-p.order"
+"$sg" ls "$work/go-p.esgz" | awk '{ print $4 }' >"$work/go-p.order"
+diff "$work/ours-p.order" "$work/go-p.order"
+head -4 "$work/ours-p.order" | tr '\n' ' ' | grep -q '^share share/two.dat bin bin/tool $'
+
+echo "conformance: ok ($(wc -l <"$work/ours.ls") entries, both ways, and prioritized)"

@@ -122,6 +122,11 @@ pub const Options = struct {
     chunk_size: u64 = default_chunk_size,
     /// zlib's default, which zigsaw's gzip layers use too; Go's writer uses 9.
     level: flate.Compress.Options = .level_6,
+    /// Files to put first, before the prefetch landmark, in this order, each
+    /// after its parent directories, as Go's `WithPrioritizedFiles` does:
+    /// what a lazy reader fetches before anything asks. Clean names
+    /// (`cleanName`'s). Only `convertSource` takes them.
+    prioritized: []const []const u8 = &.{},
 };
 
 pub const Result = struct {
@@ -139,35 +144,148 @@ pub const Result = struct {
 /// they were, then the TOC and the footer. `in`'s end-of-archive blocks are
 /// left out; the TOC's entry ends the archive. The same input and options
 /// always make the same bytes. `in` must have a buffer of at least 512 bytes;
-/// `out` isn't flushed.
+/// `out` isn't flushed. Prioritized files need `convertSource`.
 pub fn convert(gpa: Allocator, in: *Io.Reader, out: *Io.Writer, options: Options) !Result {
-    std.debug.assert(options.chunk_size > 0);
+    if (options.prioritized.len > 0) return error.EstargzPrioritizedNeedsSource;
+    var c: Conv = undefined;
+    try c.init(gpa, out, options);
+    defer c.deinit();
+    try c.landmark(no_prefetch_landmark);
+    var it: tar.Iterator = .init(gpa, in);
+    defer it.deinit();
+    while (try it.next()) |e| try c.entry(&it, e);
+    return c.finish();
+}
+
+/// As `convert`, from a tar that can be read anywhere, which prioritized
+/// files need: those first, each after its parent directories, then the
+/// prefetch landmark, then every other entry in its order. A prioritized
+/// name the tar doesn't have as a regular file fails with
+/// `error.EstargzPrioritizedNotFound`, and `not_found`, if given, says which.
+/// A name listed twice is moved once. Without any, the same bytes as
+/// `convert`'s.
+pub fn convertSource(gpa: Allocator, src: Source, out: *Io.Writer, options: Options, not_found: ?*[]const u8) !Result {
+    var buf: [64 * 1024]u8 = undefined;
+    if (options.prioritized.len == 0) {
+        var r: Source.Reader = .init(src, 0, src.size, &buf);
+        return convert(gpa, &r.interface, out, options);
+    }
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var counter_buf: [64 * 1024]u8 = undefined;
-    var counter: Counter = .init(out, &counter_buf);
-    const window = try gpa.alloc(u8, flate.max_window_len);
-    defer gpa.free(window);
-    const compress = try gpa.create(flate.Compress);
-    defer gpa.destroy(compress);
-    var m: Members = .{ .counter = &counter, .compress = compress, .window = window, .level = options.level };
+    // Where each entry starts, by its clean name.
+    const Found = struct { offset: u64, kind: tar.Kind };
+    var where: std.StringHashMapUnmanaged(Found) = .empty;
+    {
+        var r: Source.Reader = .init(src, 0, src.size, &buf);
+        var it: tar.Iterator = .init(gpa, &r.interface);
+        defer it.deinit();
+        while (try it.next()) |e| {
+            const name = try cleanName(arena, e.name);
+            if (isReserved(name)) return error.EstargzReservedName;
+            try where.put(arena, name, .{ .offset = e.offset, .kind = e.kind });
+        }
+    }
 
-    var entries: std.ArrayList(Toc.Entry) = .empty;
-    var users: Names = .{};
-    var groups: Names = .{};
+    // The entries to move, in order: each listed file's parents, then it.
+    var moved: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    for (options.prioritized) |raw| {
+        const name = try cleanName(arena, raw);
+        const file = where.get(name) orelse {
+            if (not_found) |n| n.* = raw;
+            return error.EstargzPrioritizedNotFound;
+        };
+        if (file.kind != .regular) {
+            if (not_found) |n| n.* = raw;
+            return error.EstargzPrioritizedNotFound;
+        }
+        var parts = std.mem.splitScalar(u8, name, '/');
+        var end: usize = 0;
+        while (parts.next()) |part| {
+            end += part.len;
+            if (end < name.len) if (where.get(name[0..end])) |dir| {
+                if (dir.kind == .directory) try moved.put(arena, dir.offset, {});
+            };
+            end += 1;
+        }
+        try moved.put(arena, file.offset, {});
+    }
+
+    var c: Conv = undefined;
+    try c.init(gpa, out, options);
+    defer c.deinit();
+    for (moved.keys()) |offset| {
+        var r: Source.Reader = .init(src, offset, src.size, &buf);
+        var it: tar.Iterator = .init(gpa, &r.interface);
+        defer it.deinit();
+        const e = (try it.next()) orelse return error.TarTruncated;
+        try c.entry(&it, e);
+    }
+    try c.landmark(prefetch_landmark);
+    var r: Source.Reader = .init(src, 0, src.size, &buf);
+    var it: tar.Iterator = .init(gpa, &r.interface);
+    defer it.deinit();
+    while (try it.next()) |e| {
+        if (moved.contains(e.offset)) continue;
+        try c.entry(&it, e);
+    }
+    return c.finish();
+}
+
+/// An eStargz blob being written: its members, and its TOC so far.
+const Conv = struct {
+    gpa: Allocator,
+    arena_state: std.heap.ArenaAllocator,
+    options: Options,
+    counter_buf: [64 * 1024]u8,
+    counter: Counter,
+    window: []u8,
+    compress: *flate.Compress,
+    m: Members,
+    entries: std.ArrayList(Toc.Entry) = .empty,
+    users: Names = .{},
+    groups: Names = .{},
+
     const zeros: [2 * tar.block_size]u8 = @splat(0);
 
-    {
-        try m.write(&try tarHeader(no_prefetch_landmark, 1));
-        const offset = try m.boundary();
+    /// In place: the members point at the counter, which points at its buffer.
+    fn init(c: *Conv, gpa: Allocator, out: *Io.Writer, options: Options) !void {
+        std.debug.assert(options.chunk_size > 0);
+        const window = try gpa.alloc(u8, flate.max_window_len);
+        errdefer gpa.free(window);
+        const compress = try gpa.create(flate.Compress);
+        c.* = .{
+            .gpa = gpa,
+            .arena_state = .init(gpa),
+            .options = options,
+            .counter_buf = undefined,
+            .counter = undefined,
+            .window = window,
+            .compress = compress,
+            .m = undefined,
+        };
+        c.counter = .init(out, &c.counter_buf);
+        c.m = .{ .counter = &c.counter, .compress = compress, .window = window, .level = options.level };
+    }
+
+    fn deinit(c: *Conv) void {
+        c.gpa.free(c.window);
+        c.gpa.destroy(c.compress);
+        c.arena_state.deinit();
+    }
+
+    /// A landmark file: its header, then a member with its one byte.
+    fn landmark(c: *Conv, name: []const u8) !void {
+        const arena = c.arena_state.allocator();
+        try c.m.write(&try tarHeader(name, 1));
+        const offset = try c.m.boundary();
         const contents = [_]u8{landmark_contents};
-        try m.write(&contents);
-        try m.write(zeros[0..tar.padding(1)]);
+        try c.m.write(&contents);
+        try c.m.write(zeros[0..tar.padding(1)]);
         const digest = try hashText(arena, &contents);
-        try entries.append(arena, .{
-            .name = no_prefetch_landmark,
+        try c.entries.append(arena, .{
+            .name = name,
             .type = .reg,
             .size = 1,
             .offset = offset,
@@ -176,9 +294,10 @@ pub fn convert(gpa: Allocator, in: *Io.Reader, out: *Io.Writer, options: Options
         });
     }
 
-    var it: tar.Iterator = .init(gpa, in);
-    defer it.deinit();
-    while (try it.next()) |e| {
+    /// The entry `it` just gave, with its header bytes as they were.
+    fn entry(c: *Conv, it: *tar.Iterator, e: tar.Entry) !void {
+        const arena = c.arena_state.allocator();
+        const m = &c.m;
         if (isReserved(try cleanName(arena, e.name))) return error.EstargzReservedName;
         try m.write(e.raw);
         var ent: Toc.Entry = .{
@@ -198,27 +317,27 @@ pub fn convert(gpa: Allocator, in: *Io.Reader, out: *Io.Writer, options: Options
             .mode = nonZero(e.mode),
             .uid = nonZero(e.uid),
             .gid = nonZero(e.gid),
-            .userName = try users.ifChanged(arena, e.uid, e.uname),
-            .groupName = try groups.ifChanged(arena, e.gid, e.gname),
+            .userName = try c.users.ifChanged(arena, e.uid, e.uname),
+            .groupName = try c.groups.ifChanged(arena, e.gid, e.gname),
             .devMajor = if (e.kind == .char or e.kind == .block) nonZero(e.dev_major) else null,
             .devMinor = if (e.kind == .char or e.kind == .block) nonZero(e.dev_minor) else null,
             .xattrs = try xattrMap(arena, e.xattrs),
         };
         if (e.kind != .regular) {
-            try entries.append(arena, ent);
+            try c.entries.append(arena, ent);
         } else if (e.size == 0) {
             // Go gives an empty file the digest of no bytes.
             ent.digest = try hashText(arena, "");
-            try entries.append(arena, ent);
+            try c.entries.append(arena, ent);
         } else {
-            const first = entries.items.len;
+            const first = c.entries.items.len;
             var file_hash: Sha256 = .init(.{});
             var written: u64 = 0;
             while (written < e.size) {
                 const remain = e.size - written;
-                const size = @min(remain, options.chunk_size);
+                const size = @min(remain, c.options.chunk_size);
                 // A file's last chunk goes to its end, without a size.
-                if (remain > options.chunk_size) ent.chunkSize = size;
+                if (remain > c.options.chunk_size) ent.chunkSize = size;
                 ent.offset = try m.boundary();
                 ent.chunkOffset = nonZero(written);
                 var chunk_hash: Sha256 = .init(.{});
@@ -232,36 +351,41 @@ pub fn convert(gpa: Allocator, in: *Io.Reader, out: *Io.Writer, options: Options
                     left -= bytes.len;
                 }
                 ent.chunkDigest = try digestText(arena, chunk_hash.finalResult());
-                try entries.append(arena, ent);
+                try c.entries.append(arena, ent);
                 written += size;
                 ent = .{ .name = ent.name, .type = .chunk };
             }
-            entries.items[first].digest = try digestText(arena, file_hash.finalResult());
+            c.entries.items[first].digest = try digestText(arena, file_hash.finalResult());
         }
         try m.write(try it.takePadding());
     }
 
-    const toc_offset = try m.boundary();
-    var json: Io.Writer.Allocating = .init(arena);
-    try Toc.write(.{ .version = 1, .entries = entries.items }, &json.writer);
-    var toc_digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(json.written(), &toc_digest, .{});
-    try m.write(&try tarHeader(toc_name, json.written().len));
-    try m.write(json.written());
-    try m.write(zeros[0..tar.padding(json.written().len)]);
-    try m.write(&zeros);
-    try m.end();
-    try counter.writer.writeAll(&footer(toc_offset));
-    try counter.writer.flush();
+    /// The TOC, the end of the archive and the footer.
+    fn finish(c: *Conv) !Result {
+        const arena = c.arena_state.allocator();
+        const m = &c.m;
+        const toc_offset = try m.boundary();
+        var json: Io.Writer.Allocating = .init(arena);
+        try Toc.write(.{ .version = 1, .entries = c.entries.items }, &json.writer);
+        var toc_digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(json.written(), &toc_digest, .{});
+        try m.write(&try tarHeader(toc_name, json.written().len));
+        try m.write(json.written());
+        try m.write(zeros[0..tar.padding(json.written().len)]);
+        try m.write(&zeros);
+        try m.end();
+        try c.counter.writer.writeAll(&footer(toc_offset));
+        try c.counter.writer.flush();
 
-    return .{
-        .toc_digest = toc_digest,
-        .blob_digest = counter.hash.finalResult(),
-        .blob_size = counter.count,
-        .uncompressed_size = m.uncompressed,
-        .entries = entries.items.len,
-    };
-}
+        return .{
+            .toc_digest = toc_digest,
+            .blob_digest = c.counter.hash.finalResult(),
+            .blob_size = c.counter.count,
+            .uncompressed_size = m.uncompressed,
+            .entries = c.entries.items.len,
+        };
+    }
+};
 
 fn nonZero(v: anytype) ?@TypeOf(v) {
     return if (v == 0) null else v;
@@ -879,8 +1003,18 @@ pub const Reader = struct {
 /// A tar of a few files, one of them `big_len` bytes, converted with chunks
 /// of `chunk_size` bytes.
 fn testBlob(gpa: Allocator, chunk_size: u64) !struct { []u8, Result } {
+    const archive = try testTar(gpa);
+    defer gpa.free(archive);
+    var in: Io.Reader = .fixed(archive);
+    var blob: Io.Writer.Allocating = .init(gpa);
+    errdefer blob.deinit();
+    const result = try convert(gpa, &in, &blob.writer, .{ .chunk_size = chunk_size });
+    return .{ try blob.toOwnedSlice(), result };
+}
+
+fn testTar(gpa: Allocator) ![]u8 {
     var archive: Io.Writer.Allocating = .init(gpa);
-    defer archive.deinit();
+    errdefer archive.deinit();
     var w: std.tar.Writer = .{ .underlying_writer = &archive.writer };
     try w.writeDir("bin", .{ .mode = 0o755 });
     try w.writeFileBytes("bin/tool.exe", "MZ tool", .{});
@@ -891,12 +1025,78 @@ fn testBlob(gpa: Allocator, chunk_size: u64) !struct { []u8, Result } {
     try w.writeFileBytes("share/big.dat", &big, .{});
     try w.writeFileBytes("long/" ++ tar.repeat("d", 120) ++ "/file.txt", "deep", .{ .mode = 0o600 });
     try w.finishPedantically();
+    return archive.toOwnedSlice();
+}
 
-    var in: Io.Reader = .fixed(archive.written());
+fn testPrioritized(gpa: Allocator, prioritized: []const []const u8, not_found: ?*[]const u8) ![]u8 {
+    const archive = try testTar(gpa);
+    defer gpa.free(archive);
+    const archive_const: []const u8 = archive;
     var blob: Io.Writer.Allocating = .init(gpa);
     errdefer blob.deinit();
-    const result = try convert(gpa, &in, &blob.writer, .{ .chunk_size = chunk_size });
-    return .{ try blob.toOwnedSlice(), result };
+    _ = try convertSource(gpa, .fromBytes(&archive_const), &blob.writer, .{ .chunk_size = 4096, .prioritized = prioritized }, not_found);
+    return blob.toOwnedSlice();
+}
+
+test "prioritized files come first, after their directories, then the prefetch landmark" {
+    const gpa = std.testing.allocator;
+    // Listed twice, and once not clean: moved once.
+    const blob = try testPrioritized(gpa, &.{ "share/big.dat", "./bin/tool.exe", "share/big.dat" }, null);
+    defer gpa.free(blob);
+    const blob_const: []const u8 = blob;
+    const r = try Reader.open(gpa, .fromBytes(&blob_const), .{});
+    defer r.deinit();
+    const names = [_][]const u8{ "share", "share/big.dat", "bin", "bin/tool.exe", prefetch_landmark, "empty", "long/" ++ tar.repeat("d", 120) ++ "/file.txt" };
+    try std.testing.expectEqual(names.len, r.files.len);
+    for (names, r.files) |want, f| try std.testing.expectEqualStrings(want, f.name);
+    _ = try r.verify(gpa);
+
+    var scratch: Reader.Scratch = .{};
+    defer scratch.deinit(gpa);
+    var got: Io.Writer.Allocating = .init(gpa);
+    defer got.deinit();
+    try r.readFile(gpa, &scratch, r.lookup("share/big.dat").?, &got.writer);
+    var want: [big_len]u8 = undefined;
+    testBytes(&want);
+    try std.testing.expectEqualSlices(u8, &want, got.written());
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    _ = try @import("plan.zig").members(arena.allocator(), r);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dest = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path, "out" });
+    try r.extract(std.testing.io, gpa, dest, .{});
+    const tool = try Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fs.path.join(arena.allocator(), &.{ dest, "bin", "tool.exe" }), arena.allocator(), .limited(64));
+    try std.testing.expectEqualStrings("MZ tool", tool);
+
+    // As "the same bytes every time": a prioritized layer's digest.
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(blob, &digest, .{});
+    try std.testing.expectEqualStrings("7680b67264a6c03af486686a1797f5c6e6b5824fca6eaaf9c3f0d37eef2c3d45", &std.fmt.bytesToHex(digest, .lower));
+}
+
+test "without prioritized files, convertSource makes convert's bytes" {
+    const gpa = std.testing.allocator;
+    const a, _ = try testBlob(gpa, 4096);
+    defer gpa.free(a);
+    const b = try testPrioritized(gpa, &.{}, null);
+    defer gpa.free(b);
+    try std.testing.expectEqualSlices(u8, a, b);
+}
+
+test "a prioritized name that isn't a file of the tar's" {
+    const gpa = std.testing.allocator;
+    var which: []const u8 = "";
+    try std.testing.expectError(error.EstargzPrioritizedNotFound, testPrioritized(gpa, &.{ "bin/tool.exe", "bin/missing" }, &which));
+    try std.testing.expectEqualStrings("bin/missing", which);
+    try std.testing.expectError(error.EstargzPrioritizedNotFound, testPrioritized(gpa, &.{"share"}, &which));
+    try std.testing.expectEqualStrings("share", which);
+
+    var in: Io.Reader = .fixed("");
+    var sink: Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.EstargzPrioritizedNeedsSource, convert(gpa, &in, &sink.writer, .{ .prioritized = &.{"bin/tool.exe"} }));
 }
 
 const big_len = 10_000;

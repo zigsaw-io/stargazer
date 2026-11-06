@@ -3,8 +3,9 @@
 //
 //	conformance mktar <out.tar>
 //	    a tar of every kind of entry stargazer and Go handle, written by Go
-//	conformance build <chunk-size> <in.tar> <out.blob>
-//	    an eStargz blob made by Go; prints its TOC digest
+//	conformance build <chunk-size> <in.tar> <out.blob> [<prioritized>]
+//	    an eStargz blob made by Go; prints its TOC digest. With a file of
+//	    names, one a line, those are prioritized (WithPrioritizedFiles)
 //	conformance check <blob> <toc-digest>
 //	    opens a blob with Go's reader, checks the TOC's digest and every
 //	    chunk's, and lists the tree as `stargazer ls` does, sorted
@@ -37,10 +38,14 @@ func main() {
 		}
 		err = mktar(os.Args[2])
 	case "build":
-		if len(os.Args) != 5 {
+		if len(os.Args) != 5 && len(os.Args) != 6 {
 			usage()
 		}
-		err = build(os.Args[2], os.Args[3], os.Args[4])
+		prioritized := ""
+		if len(os.Args) == 6 {
+			prioritized = os.Args[5]
+		}
+		err = build(os.Args[2], os.Args[3], os.Args[4], prioritized)
 	case "check":
 		if len(os.Args) != 4 {
 			usage()
@@ -56,7 +61,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: conformance mktar <out.tar> | build <chunk-size> <in.tar> <out> | check <blob> <toc-digest>")
+	fmt.Fprintln(os.Stderr, "usage: conformance mktar <out.tar> | build <chunk-size> <in.tar> <out> [<prioritized>] | check <blob> <toc-digest>")
 	os.Exit(2)
 }
 
@@ -112,7 +117,7 @@ func mktar(out string) error {
 	return os.WriteFile(out, buf.Bytes(), 0o644)
 }
 
-func build(chunk, in, out string) error {
+func build(chunk, in, out, prioritized string) error {
 	chunkSize, err := strconv.Atoi(chunk)
 	if err != nil {
 		return err
@@ -126,7 +131,15 @@ func build(chunk, in, out string) error {
 	if err != nil {
 		return err
 	}
-	blob, err := estargz.Build(io.NewSectionReader(f, 0, st.Size()), estargz.WithChunkSize(chunkSize))
+	opts := []estargz.Option{estargz.WithChunkSize(chunkSize)}
+	if prioritized != "" {
+		list, err := os.ReadFile(prioritized)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, estargz.WithPrioritizedFiles(strings.Fields(string(list))))
+	}
+	blob, err := estargz.Build(io.NewSectionReader(f, 0, st.Size()), opts...)
 	if err != nil {
 		return err
 	}

@@ -70,10 +70,17 @@ fn run(io: Io, gpa: Allocator, arena: Allocator, all_args: []const [:0]const u8)
         try expectArgs(args.items, 0, options, &.{});
         try out.print("{s}\n", .{stargazer.version});
     } else if (std.mem.eql(u8, command, "convert")) {
-        try expectArgs(args.items, 2, options, &.{"chunk-size"});
+        try expectArgs(args.items, 2, options, &.{ "chunk-size", "prioritized" });
         var opts: estargz.Options = .{};
         if (options.get("chunk-size")) |text| opts.chunk_size = std.fmt.parseInt(u64, text, 10) catch return error.Usage;
         if (opts.chunk_size == 0) return error.Usage;
+        if (options.get("prioritized")) |path| {
+            const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch |err| return reported(io, "{s}: {s}", .{ path, @errorName(err) });
+            var names: std.ArrayList([]const u8) = .empty;
+            var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+            while (lines.next()) |line| try names.append(arena, line);
+            opts.prioritized = names.items;
+        }
         try convert(io, gpa, args.items[0], args.items[1], opts, out);
     } else if (std.mem.eql(u8, command, "info")) {
         try expectArgs(args.items, 1, options, &.{});
@@ -224,12 +231,19 @@ fn convert(io: Io, gpa: Allocator, in_path: []const u8, out_path: []const u8, op
     var tar_buf: [64 * 1024]u8 = undefined;
     var members: stargazer.gzip.MemberReader = .init(gpa, &in, window, &tar_buf, null);
     const tar_in = if (gzipped) &members.interface else &in.interface;
+    if (options.prioritized.len > 0 and gzipped) return reported(io, "{s}: prioritized files need a plain tar", .{in_path});
 
     var out_file = Io.Dir.cwd().createFile(io, out_path, .{}) catch |err| return reported(io, "{s}: {s}", .{ out_path, @errorName(err) });
     defer out_file.close(io);
     var blob_buf: [64 * 1024]u8 = undefined;
     var blob = out_file.writer(io, &blob_buf);
-    const result = estargz.convert(gpa, tar_in, &blob.interface, options) catch |err| {
+    var not_found: []const u8 = "";
+    const converted = if (options.prioritized.len > 0)
+        estargz.convertSource(gpa, source, &blob.interface, options, &not_found)
+    else
+        estargz.convert(gpa, tar_in, &blob.interface, options);
+    const result = converted catch |err| {
+        if (err == error.EstargzPrioritizedNotFound) return reported(io, "{s}: no file {s}", .{ in_path, not_found });
         if (err == error.ReadFailed) {
             if (members.err) |cause| return cause;
             if (in.err) |cause| return cause;
